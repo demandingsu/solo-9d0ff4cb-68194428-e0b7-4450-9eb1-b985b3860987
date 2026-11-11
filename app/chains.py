@@ -5,16 +5,21 @@
 1. 公告分三类：first（首次公告）、correction（更正）、revocation（撤销）。
    更正/撤销通过「引用编号」指向上一条公告，沿引用反向追溯得到一条链，
    链标识取链上首次公告的公告编号。
-2. 同一项目编号下可以有多条独立的首次公告，彼此保持独立、不合并。
-3. 出现以下情况之一，链上相关公告标记为冲突（conflict），且**不推测截止
+2. **链的作用域是列表入口（list_url）**：不同采购目录允许出现相同公告编号，
+   各自独立建库、独立成链。更正/撤销只在本入口内沿编号查找引用：
+     - 本入口内找不到被引用公告 -> missing_reference 冲突，绝不借用另一入口
+       的同号公告；
+     - 并行更正、成环、撤销终止等判断同样只在本入口内进行。
+3. 同一项目编号下可以有多条独立的首次公告，彼此保持独立、不合并。
+4. 出现以下情况之一，链上相关公告标记为冲突（conflict），且**不推测截止
    时间**（有效截止时间为 null）：
-     - missing_reference：引用编号在库中不存在；
+     - missing_reference：引用编号在本入口库内不存在；或更正/撤销未填引用编号；
      - reference_cycle：引用关系成环；
      - parallel_correction：同一公告存在两个及以上并行后继（并行更正）；
      - first_notice_with_reference：首次公告却带引用编号（结构异常）。
-4. 撤销使整条链失效：链状态为 cancelled，有效截止时间为 null；
+5. 撤销使整条链失效：链状态为 cancelled，有效截止时间为 null；
    撤销之后又挂接的公告不再属于该链，作为孤立异常公告处理。
-5. 无法归入任何链的公告进入 orphans（孤立异常公告）。
+6. 无法归入任何链的公告进入 orphans（孤立异常公告）。
 """
 from __future__ import annotations
 
@@ -37,16 +42,39 @@ UNREACHABLE = "unreachable"
 
 
 def recompute(conn: sqlite3.Connection) -> None:
-    """依据库内全部公告重新计算链归属、状态与有效截止时间，并落库。"""
+    """依据库内全部公告重新计算链归属、状态与有效截止时间，并落库。
+
+    每个列表入口（list_url）构成一个独立作用域，互不引用、互不合并。
+    """
     rows = conn.execute(
         "SELECT * FROM announcements ORDER BY id"
     ).fetchall()
-    notices = {r["notice_no"]: dict(r) for r in rows}
 
+    # 作用域（list_url）-> {公告编号: 行字典}
+    scopes: dict[str, dict[str, dict]] = defaultdict(dict)
+    for r in rows:
+        scopes[r["list_url"] or ""][r["notice_no"]] = dict(r)
+
+    # 先重置全部公告的计算字段，再按作用域逐条回写
+    conn.execute(
+        "UPDATE announcements SET chain_id = NULL, chain_status = 'orphan', "
+        "conflict_reasons = NULL, effective_deadline = NULL"
+    )
+
+    for list_url, notices in scopes.items():
+        _recompute_scope(conn, list_url, notices)
+    conn.commit()
+
+
+def _recompute_scope(
+    conn: sqlite3.Connection,
+    list_url: str,
+    notices: dict[str, dict],
+) -> None:
+    """在单个列表入口作用域内完成链归并、冲突识别与回写。"""
     conflicts: dict[str, set[str]] = defaultdict(set)
-    # 被引用编号 -> 后继公告列表
+    # 被引用编号 -> 后继公告列表（仅记录本入口内存在的引用）
     successors: dict[str, list[str]] = defaultdict(list)
-    # 父公告编号 -> 后继公告列表（仅引用存在时）
     for n in notices.values():
         ref = n["ref_notice_no"]
         if n["notice_type"] != FIRST and not ref:
@@ -54,6 +82,7 @@ def recompute(conn: sqlite3.Connection) -> None:
             conflicts[n["notice_no"]].add(MISSING_REFERENCE)
         if ref:
             if ref not in notices:
+                # 本入口内不存在该引用：标记冲突，不跨入口借用同号公告
                 conflicts[n["notice_no"]].add(MISSING_REFERENCE)
             else:
                 successors[ref].append(n["notice_no"])
@@ -131,24 +160,22 @@ def recompute(conn: sqlite3.Connection) -> None:
         chain_updates[root] = (status, effective_deadline,
                                json.dumps(chain_conflict, ensure_ascii=False))
 
-    # 落库：先重置全部公告的计算字段
-    conn.execute(
-        "UPDATE announcements SET chain_id = NULL, chain_status = 'orphan', "
-        "conflict_reasons = NULL, effective_deadline = NULL"
-    )
+    # 回写：chain_id 存本入口内的首次公告编号（配合 list_url 唯一定位）
     for root, members in chain_members.items():
-        status, effective, reasons_json = chain_updates[root]
+        status, effective, _reasons_json = chain_updates[root]
         for no in members:
             per_notice = sorted(conflicts[no])
             conn.execute(
                 "UPDATE announcements SET chain_id = ?, chain_status = ?, "
-                "conflict_reasons = ?, effective_deadline = ? WHERE notice_no = ?",
+                "conflict_reasons = ?, effective_deadline = ? "
+                "WHERE list_url = ? AND notice_no = ?",
                 (
                     root,
                     status,
                     json.dumps(per_notice, ensure_ascii=False)
                     if per_notice else None,
                     effective if not per_notice and status == "ok" else None,
+                    list_url,
                     no,
                 ),
             )
@@ -156,10 +183,14 @@ def recompute(conn: sqlite3.Connection) -> None:
         per_notice = sorted(conflicts[no])
         conn.execute(
             "UPDATE announcements SET chain_id = NULL, chain_status = 'orphan', "
-            "conflict_reasons = ?, effective_deadline = NULL WHERE notice_no = ?",
-            (json.dumps(per_notice, ensure_ascii=False) if per_notice else None, no),
+            "conflict_reasons = ?, effective_deadline = NULL "
+            "WHERE list_url = ? AND notice_no = ?",
+            (
+                json.dumps(per_notice, ensure_ascii=False) if per_notice else None,
+                list_url,
+                no,
+            ),
         )
-    conn.commit()
 
 
 def _mark_cycles(
@@ -168,12 +199,10 @@ def _mark_cycles(
     """检测引用环，环上每个公告都标记 reference_cycle。"""
     state: dict[str, int] = {}  # 0=访问中 1=已完成
     stack: list[str] = []
-    in_stack: set[str] = set()
 
     def visit(no: str) -> None:
         state[no] = 0
         stack.append(no)
-        in_stack.add(no)
         ref = notices[no]["ref_notice_no"]
         if ref and ref in notices:
             mark = state.get(ref)
@@ -185,7 +214,6 @@ def _mark_cycles(
             elif mark is None:
                 visit(ref)
         stack.pop()
-        in_stack.discard(no)
         state[no] = 1
 
     for no in notices:

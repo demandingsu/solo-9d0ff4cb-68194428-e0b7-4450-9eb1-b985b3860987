@@ -1,6 +1,12 @@
 """示例公共采购公告站（仅依赖 Python 标准库）。
 
-用于在本地/容器内演示采集 API，覆盖以下场景：
+站内提供两个采购目录（两个列表入口），用于演示「同编号公告按列表入口
+分别保存、更正/撤销只沿本入口编号查找引用」的修复：
+
+  /announcements    目录一（综合采购目录），详情前缀 /notice/{编号}
+  /announcements-2  目录二（专项采购目录），详情前缀 /notice2/{编号}
+
+目录一场景（链 A~H 与旧版一致，另加双目录同号场景）：
   链 A：首次 + 更正（含截止时间继承）
   链 B：首次 + 更正 + 撤销（撤销使链失效）
   链 C：并行更正（同一公告有两个后继 -> 冲突）
@@ -9,10 +15,19 @@
   链 F：更正无引用编号（missing_reference -> 孤立）
   链 G：同一项目两个独立首次公告（保持两条独立链）
   公告 H：可通过 /fail-toggle 控制详情页返回 500，验证失败保留上次结果
+  X-001 / X-002：目录一自己的同号公告与更正（X-002 只引用目录一的 X-001）
+  X-009：更正引用 X-010；X-010 只存在于目录二，目录一应判 missing_reference，
+         绝不跨目录借用目录二的 X-010
+
+目录二场景：
+  X-001 / X-002：与目录一同编号但内容不同（截止时间不同），独立成链、互不覆盖
+  Y-001：目录二独立首次公告
+  X-010：被目录一 X-009 引用，但只服务于目录二内部
+  Z-001：可切换 500 故障，验证一个入口的详情失败不改动另一入口的同号公告
 
 控制接口：
-  GET /fail-toggle?enabled=1|0   开关 H-001 详情页的 500 故障
-  GET /fail-status               查询当前故障开关
+  GET /fail-toggle?enabled=1|0[&catalog=/announcements-2][&no=Z-001]
+  GET /fail-status
 """
 from __future__ import annotations
 
@@ -22,7 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 # 每条公告：编号、项目编号、类型、发布时间、截止时间、引用编号
-NOTICES: list[dict] = [
+CATALOG_1: list[dict] = [
     # 链 A：正常链，COR-A-02 不带截止时间（应继承首次的截止时间）
     {"no": "A-001", "project": "PRJ-A", "type": "首次公告",
      "publish": "2026-10-20 09:00:00", "deadline": "2026-11-20 09:30:00",
@@ -89,12 +104,85 @@ NOTICES: list[dict] = [
     {"no": "H-001", "project": "PRJ-H", "type": "首次公告",
      "publish": "2026-10-30 09:00:00", "deadline": "2026-11-30 09:30:00",
      "ref": ""},
+
+    # 双目录同号场景：目录一自己的 X-001 链（截止时间与目录二不同）
+    {"no": "X-001", "project": "PRJ-X1", "type": "首次公告",
+     "publish": "2026-11-02 09:00:00", "deadline": "2026-12-05 09:30:00",
+     "ref": ""},
+    {"no": "X-002", "project": "PRJ-X1", "type": "更正公告",
+     "publish": "2026-11-04 10:00:00", "deadline": "2026-12-08 15:00:00",
+     "ref": "X-001"},
+    # 引用陷阱：X-010 只存在于目录二；目录一必须判 missing_reference，
+    # 不能借用目录二的 X-010。
+    {"no": "X-009", "project": "PRJ-X1", "type": "更正公告",
+     "publish": "2026-11-05 10:00:00", "deadline": "2026-12-09 15:00:00",
+     "ref": "X-010"},
 ]
 
-NOTICE_BY_NO = {n["no"]: n for n in NOTICES}
+CATALOG_2: list[dict] = [
+    # 与目录一同编号 X-001/X-002，但属于不同采购目录，内容独立
+    {"no": "X-001", "project": "PRJ-X2", "type": "首次公告",
+     "publish": "2026-11-03 09:00:00", "deadline": "2026-12-15 09:30:00",
+     "ref": ""},
+    {"no": "X-002", "project": "PRJ-X2", "type": "更正公告",
+     "publish": "2026-11-06 14:00:00", "deadline": "2026-12-18 15:00:00",
+     "ref": "X-001"},
+    # 目录二独立首次公告
+    {"no": "Y-001", "project": "PRJ-Y", "type": "首次公告",
+     "publish": "2026-11-07 09:00:00", "deadline": "2026-12-20 09:30:00",
+     "ref": ""},
+    # 目录一 X-009 引用的编号只在本目录存在，禁止跨目录借用
+    {"no": "X-010", "project": "PRJ-X2", "type": "首次公告",
+     "publish": "2026-11-08 09:00:00", "deadline": "2026-12-21 09:30:00",
+     "ref": ""},
+    # 故障开关目标：验证本入口失败不影响目录一的同号/其他公告
+    {"no": "Z-001", "project": "PRJ-Z", "type": "首次公告",
+     "publish": "2026-11-09 09:00:00", "deadline": "2026-12-22 09:30:00",
+     "ref": ""},
+]
 
-# 运行期故障开关（内存态，重启容器即恢复）
-FAIL_ENABLED = {"H-001": False}
+# 列表入口路径 -> （目录标题、详情前缀、公告列表）
+CATALOGS: dict[str, dict] = {
+    "/announcements": {
+        "title": "公共采购公告列表 · 目录一（综合采购目录）",
+        "detail_prefix": "/notice",
+        "notices": CATALOG_1,
+    },
+    "/announcements-2": {
+        "title": "公共采购公告列表 · 目录二（专项采购目录）",
+        "detail_prefix": "/notice2",
+        "notices": CATALOG_2,
+    },
+}
+
+# (列表入口, 公告编号) -> 公告数据
+NOTICE_INDEX: dict[tuple[str, str], dict] = {
+    (path, n["no"]): n
+    for path, catalog in CATALOGS.items()
+    for n in catalog["notices"]
+}
+
+# 兼容旧名称：目录一的编号索引
+NOTICE_BY_NO = {n["no"]: n for n in CATALOG_1}
+NOTICES = CATALOG_1
+
+
+def _fail_key(catalog_path: str, no: str) -> str:
+    return f"{catalog_path}|{no}"
+
+
+# 运行期故障开关（内存态，重启容器即恢复）：key = "列表入口|公告编号"
+FAIL_ENABLED: dict[str, bool] = {
+    _fail_key("/announcements", "H-001"): False,
+    _fail_key("/announcements-2", "Z-001"): False,
+}
+
+
+def reset_failures() -> None:
+    """恢复全部详情页故障开关（测试夹具使用）。"""
+    for key in FAIL_ENABLED:
+        FAIL_ENABLED[key] = False
+
 
 PAGE_CSS = """
 body { font-family: sans-serif; margin: 2em; color: #222; }
@@ -107,23 +195,46 @@ a { color: #1a56c4; }
 """
 
 
-def render_list() -> str:
-    rows = "\n".join(
-        '<tr><td><a href="/notice/{no}">{no}</a></td>'
-        '<td>{project}</td><td>{type}</td><td>{publish}</td></tr>'.format(
-            no=escape(n["no"]), project=escape(n["project"]),
-            type=escape(n["type"]), publish=escape(n["publish"]),
-        )
-        for n in NOTICES
+def render_home() -> str:
+    items = "".join(
+        f'<li><a href="{escape(path)}">{escape(c["title"])}</a>'
+        f'（{len(c["notices"])} 条）</li>'
+        for path, c in CATALOGS.items()
     )
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
-<title>公共采购公告列表</title><style>{PAGE_CSS}</style></head>
+<title>示例公共采购公告站</title><style>{PAGE_CSS}</style></head>
 <body>
-<h1>公共采购公告列表（示例站）</h1>
-<p class="meta">共 {len(NOTICES)} 条公告 · 仅用于演示采集 API</p>
+<h1>示例公共采购公告站</h1>
+<p class="meta">两个采购目录存在相同公告编号（X-001 / X-002），用于演示按列表入口隔离。</p>
+<ul>{items}</ul>
+</body></html>"""
+
+
+def render_list(catalog_path: str) -> str:
+    catalog = CATALOGS[catalog_path]
+    prefix = catalog["detail_prefix"]
+    rows = "\n".join(
+        '<tr><td><a href="{prefix}/{no}">{no}</a></td>'
+        '<td>{project}</td><td>{type}</td><td>{publish}</td>'
+        '<td>{ref}</td></tr>'.format(
+            prefix=prefix,
+            no=escape(n["no"]), project=escape(n["project"]),
+            type=escape(n["type"]), publish=escape(n["publish"]),
+            ref=escape(n["ref"]) or "—",
+        )
+        for n in catalog["notices"]
+    )
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>{escape(catalog['title'])}</title><style>{PAGE_CSS}</style></head>
+<body>
+<h1>{escape(catalog['title'])}</h1>
+<p class="meta">共 {len(catalog['notices'])} 条公告 · 仅用于演示采集 API ·
+<a href="/">← 返回站点首页</a></p>
 <table class="announcement-list">
-<thead><tr><th>公告编号</th><th>项目编号</th><th>类型</th><th>发布时间</th></tr></thead>
+<thead><tr><th>公告编号</th><th>项目编号</th><th>类型</th>
+<th>发布时间</th><th>引用编号</th></tr></thead>
 <tbody>{rows}</tbody>
 </table>
 </body></html>"""
@@ -136,8 +247,9 @@ def _row(label: str, value: str) -> str:
     )
 
 
-def render_detail(no: str) -> str:
-    n = NOTICE_BY_NO[no]
+def render_detail(catalog_path: str, no: str) -> str:
+    n = NOTICE_INDEX[(catalog_path, no)]
+    back = catalog_path
     rows = "".join([
         _row("公告编号", n["no"]),
         _row("项目编号", n["project"]),
@@ -150,8 +262,8 @@ def render_detail(no: str) -> str:
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>公告 {escape(n['no'])}</title><style>{PAGE_CSS}</style></head>
 <body>
-<h1>公告详情 {escape(n['no'])}</h1>
-<p><a href="/announcements">← 返回列表</a></p>
+<h1>公告详情 {escape(n['no'])}（{escape(catalog_path)}）</h1>
+<p><a href="{escape(back)}">← 返回列表</a></p>
 <table class="detail-table"><tbody>{rows}</tbody></table>
 </body></html>"""
 
@@ -171,38 +283,58 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/") or "/"
         query = parse_qs(parsed.query)
 
-        if path in ("/", "/announcements"):
-            self._send(render_list())
+        if path == "/":
+            self._send(render_home())
+            return
+
+        if path in CATALOGS:
+            self._send(render_list(path))
             return
 
         if path == "/fail-toggle":
             enabled = (query.get("enabled", ["0"])[0] in {"1", "true", "yes"})
-            FAIL_ENABLED["H-001"] = enabled
+            catalog_path = query.get("catalog", ["/announcements"])[0]
+            no = query.get("no", ["H-001"])[0]
+            if catalog_path not in CATALOGS:
+                self._send(
+                    f'{{"error": "unknown catalog {catalog_path}"}}',
+                    status=400,
+                    content_type="application/json; charset=utf-8",
+                )
+                return
+            key = _fail_key(catalog_path, no)
+            FAIL_ENABLED[key] = enabled
             self._send(
-                f'{{"H-001_fail_enabled": {str(enabled).lower()}}}',
+                f'{{"catalog": {catalog_path!r}, "notice_no": {no!r}, '
+                f'"fail_enabled": {str(enabled).lower()}}}',
                 content_type="application/json; charset=utf-8",
             )
             return
 
         if path == "/fail-status":
-            enabled = FAIL_ENABLED["H-001"]
+            statuses = {key: bool(on) for key, on in FAIL_ENABLED.items()}
+            import json
             self._send(
-                f'{{"H-001_fail_enabled": {str(enabled).lower()}}}',
+                json.dumps(statuses, ensure_ascii=False),
                 content_type="application/json; charset=utf-8",
             )
             return
 
-        if path.startswith("/notice/"):
-            no = path.rsplit("/", 1)[-1]
-            notice = NOTICE_BY_NO.get(no)
-            if notice is None:
-                self._send("<h1>404 公告不存在</h1>", status=404)
+        # 详情页：两个目录使用不同前缀
+        for catalog_path, catalog in CATALOGS.items():
+            prefix = catalog["detail_prefix"] + "/"
+            if path.startswith(prefix):
+                no = path[len(prefix):]
+                if (catalog_path, no) not in NOTICE_INDEX:
+                    self._send("<h1>404 公告不存在</h1>", status=404)
+                    return
+                if FAIL_ENABLED.get(_fail_key(catalog_path, no)):
+                    self._send(
+                        "<h1>500 服务器内部错误（模拟故障）</h1>", status=500
+                    )
+                    return
+                self._send(render_detail(catalog_path, no))
                 return
-            if FAIL_ENABLED.get(no):
-                self._send("<h1>500 服务器内部错误（模拟故障）</h1>", status=500)
-                return
-            self._send(render_detail(no))
-            return
 
         self._send("<h1>404</h1>", status=404)
 

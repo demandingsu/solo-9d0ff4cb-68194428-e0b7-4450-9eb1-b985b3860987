@@ -16,15 +16,15 @@ def test_full_sync_and_counts(client, site_base_url):
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "success"
-    assert body["total_listed"] == 17
-    assert body["fetched_ok"] == 17
+    assert body["total_listed"] == 20
+    assert body["fetched_ok"] == 20
     assert body["failed_count"] == 0
 
     result = c.get("/api/v1/chains").json()
-    # 6 条链：A、B、C、G-001、G-101、H
-    assert len(result["chains"]) == 6
-    # 5 条孤立异常：D-001、E-001、E-002、F-001
-    assert len(result["orphans"]) == 4
+    # 7 条链：A、B、C、G-001、G-101、H、X-001（目录一）
+    assert len(result["chains"]) == 7
+    # 5 条孤立异常：D-001、E-001、E-002、F-001、X-009
+    assert len(result["orphans"]) == 5
 
 
 def test_normal_chain_status_and_effective_deadline(client, site_base_url):
@@ -144,7 +144,7 @@ def test_sync_runs_recorded_and_health(client, site_base_url):
     runs = c.get("/api/v1/sync-runs").json()["runs"]
     assert len(runs) == 1
     assert runs[0]["status"] == "success"
-    assert runs[0]["total_listed"] == 17
+    assert runs[0]["total_listed"] == 20
 
 
 def test_sync_bad_url_rejected(client):

@@ -14,6 +14,16 @@ services:
       - api-data:/data
     depends_on:
       - sample-site
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status == 200 else 1)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   sample-site:
     build:
@@ -21,6 +31,24 @@ services:
       dockerfile: sample_site/Dockerfile
     ports:
       - "8080:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -I
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/announcements-2', timeout=3).status == 200 else 1)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
 
+# 启动后演示双目录同号场景（容器内 sample-site 主机名即服务名）：
+#   curl -X POST http://localhost:8000/api/v1/sync -H 'Content-Type: application/json' \
+#     -d '{"list_url": "http://sample-site:8080/announcements"}'
+#   curl -X POST http://localhost:8000/api/v1/sync -H 'Content-Type: application/json' \
+#     -d '{"list_url": "http://sample-site:8080/announcements-2"}'
+#   curl 'http://localhost:8000/api/v1/announcements/X-001'                       # 409
+#   curl 'http://localhost:8000/api/v1/chains?list_url=http%3A%2F%2Fsample-site%3A8080%2Fannouncements-2'
 volumes:
   api-data:

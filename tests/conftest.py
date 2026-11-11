@@ -28,8 +28,8 @@ def site_base_url() -> str:
     port = httpd.server_address[1]
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
-    # 每个测试会话从正常状态开始
-    sample_server.FAIL_ENABLED["H-001"] = False
+    # 每个测试会话从正常状态开始（两个目录的故障开关全部关闭）
+    sample_server.reset_failures()
     yield f"http://127.0.0.1:{port}"
     httpd.shutdown()
     httpd.server_close()
@@ -55,9 +55,19 @@ def client(tmp_path, monkeypatch):
         yield c, sample_server
 
 
-def _fail_toggle(base_url: str, enabled: bool) -> None:
+def _fail_toggle(
+    base_url: str,
+    enabled: bool,
+    catalog: str = "/announcements",
+    no: str = "H-001",
+) -> None:
     conn = HTTPConnection("127.0.0.1", base_url.rsplit(":", 1)[1])
-    conn.request("GET", f"/fail-toggle?enabled={'1' if enabled else '0'}")
+    from urllib.parse import quote
+    conn.request(
+        "GET",
+        f"/fail-toggle?enabled={'1' if enabled else '0'}"
+        f"&catalog={quote(catalog, safe='')}&no={quote(no, safe='')}",
+    )
     resp = conn.getresponse()
     resp.read()
     conn.close()
@@ -65,7 +75,11 @@ def _fail_toggle(base_url: str, enabled: bool) -> None:
 
 @pytest.fixture()
 def set_fail(site_base_url):
-    def _set(enabled: bool) -> None:
-        _fail_toggle(site_base_url, enabled)
+    def _set(
+        enabled: bool,
+        catalog: str = "/announcements",
+        no: str = "H-001",
+    ) -> None:
+        _fail_toggle(site_base_url, enabled, catalog, no)
 
     return _set

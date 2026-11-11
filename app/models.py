@@ -10,6 +10,7 @@ class SyncRequest(BaseModel):
 
 class AnnouncementItem(BaseModel):
     notice_no: str
+    list_url: Optional[str] = Field(None, description="所属列表入口 URL")
     project_no: Optional[str] = None
     notice_type: Optional[str] = None
     publish_time: Optional[str] = None
@@ -21,7 +22,8 @@ class AnnouncementItem(BaseModel):
 
 
 class Chain(BaseModel):
-    chain_id: str = Field(..., description="链标识，即首次公告编号")
+    chain_id: str = Field(..., description="链标识，即本入口内首次公告编号")
+    list_url: Optional[str] = Field(None, description="所属列表入口 URL")
     project_no: Optional[str] = None
     status: str = Field(..., description="ok / conflict / cancelled")
     effective_deadline: Optional[str] = Field(
@@ -32,6 +34,7 @@ class Chain(BaseModel):
 
 class OrphanAnnouncement(BaseModel):
     notice_no: str
+    list_url: Optional[str] = Field(None, description="所属列表入口 URL")
     project_no: Optional[str] = None
     notice_type: Optional[str] = None
     status: str
